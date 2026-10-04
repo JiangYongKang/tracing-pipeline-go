@@ -181,6 +181,11 @@ const (
 	ClassConflict
 	// ClassDuplicate: exact same (trace id, span id) was already accepted.
 	ClassDuplicate
+	// ClassRevisit: the record is valid and its trace was seen before, but
+	// the previous runtime lifecycle was reclaimed by retention; the record
+	// begins a new lifecycle (generation >= 2). It carries a valid Span and
+	// flows through sampling/export exactly like ClassOK.
+	ClassRevisit
 )
 
 // String renders the classification for logs and metrics.
@@ -198,6 +203,8 @@ func (c Class) String() string {
 		return "conflict"
 	case ClassDuplicate:
 		return "duplicate"
+	case ClassRevisit:
+		return "revisit"
 	default:
 		return "unknown"
 	}
@@ -209,7 +216,21 @@ type Outcome struct {
 	RawHint string // raw identifier hint as received, for log correlation
 	Status  Class
 	Reason  string
-	Span    *Span // non-nil iff Status == ClassOK
+	Span    *Span // non-nil iff Status == ClassOK or ClassRevisit
+
+	// Revisit marks that the record's trace was seen before but its previous
+	// runtime lifecycle had already been reclaimed by retention. Two cases:
+	//   - Status == ClassRevisit: a new lifecycle (Generation >= 2) begins.
+	//   - Status == ClassDuplicate && Protected: the span is still inside
+	//     the exporter's duplicate-protection window, so the original
+	//     conclusion stands and no new lifecycle begins.
+	Revisit bool
+	// Protected is set when a revisit was suppressed because the span key is
+	// still protected by the bounded export dedup bookkeeping.
+	Protected bool
+	// Generation identifies the lifecycle this record belongs to (>=1 when
+	// Span != nil, >=2 for ClassRevisit; 0 when no lifecycle was begun).
+	Generation uint64
 }
 
 // Decision is a per-trace sampling verdict.

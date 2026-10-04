@@ -11,6 +11,7 @@ import (
 	"github.com/highcumontoa/tracing-pipeline-go/internal/export"
 	"github.com/highcumontoa/tracing-pipeline-go/internal/model"
 	"github.com/highcumontoa/tracing-pipeline-go/internal/pipeline"
+	"github.com/highcumontoa/tracing-pipeline-go/internal/retention"
 )
 
 func main() {
@@ -22,7 +23,12 @@ func main() {
 		RetryBackoff:       2 * time.Millisecond,
 		DeadLetterCapacity: 32,
 	}
-	p := pipeline.New(cfg, 1.0, log.Printf)
+	// Bounded runtime lifecycle state: at most 8 live traces, idle traces
+	// reclaimed after a minute, reclamation remembered for revisit
+	// classification. Defaults are far larger; tiny values here make
+	// reclamation observable in a short demo.
+	ret := retention.Config{MaxTraces: 8, TTL: time.Minute, TombstoneCap: 2048, SweepBatch: 4}
+	p := pipeline.NewWithRetention(cfg, 1.0, ret, log.Printf)
 	p.Start()
 	defer func() {
 		// Bounded shutdown: backpressure policy already permits rejecting
@@ -90,6 +96,24 @@ func main() {
 	}
 	fmt.Printf("burst rejections due to bounded backpressure: %d\n", full)
 
+	fmt.Println("== phase 6: retention reclaim + revisit of a reclaimed trace ==")
+	p.Reporter().SetBehavior(export.Behavior{Mode: export.ModeOK})
+	// Churn enough unique traces to reclaim t1's lifecycle (cap is 8).
+	for i := 0; i < 16; i++ {
+		p.Submit(model.RawRecord{
+			Source:  model.SourceInproc,
+			TraceID: fmt.Sprintf("%032x", 900000+i), SpanID: fmt.Sprintf("%016x", 900000+i),
+			Name: "churn", StartNano: 1, EndNano: 2,
+		})
+	}
+	// A late child of t1 arrives after reclamation: it is classified as a
+	// revisit and begins a distinguishable new lifecycle (generation 2).
+	res := p.Submit(model.RawRecord{Source: model.SourceInproc, TraceID: t1, SpanID: "abababababababab",
+		ParentSpanID: "1212121212121212", Name: "late-after-reclaim", StartNano: 5, EndNano: 6})
+	fmt.Printf("revisit of t1: class=%s revisit=%v generation=%d decision=%s enqueued=%v\n",
+		res.Outcome.Status, res.Revisit, res.Generation, res.Decision, res.Enqueued)
+	flush(p)
+
 	printStats(p)
 }
 
@@ -104,8 +128,11 @@ func flush(p *pipeline.Pipeline) {
 func printStats(p *pipeline.Pipeline) {
 	st := p.Stats()
 	fmt.Println("== stats ==")
-	fmt.Printf("received=%d normalized_ok=%d sampled=%d dropped=%d\n",
-		st.Received, st.NormalizedOK, st.Sampled, st.Dropped)
+	fmt.Printf("received=%d normalized_ok=%d sampled=%d dropped=%d revisits=%d protected_revisits=%d\n",
+		st.Received, st.NormalizedOK, st.Sampled, st.Dropped, st.Revisits, st.ProtectedRevisits)
+	r := st.Retention
+	fmt.Printf("retention: live_traces=%d live_spans=%d tombstones=%d evicted_capacity=%d evicted_ttl=%d lifecycles=%d\n",
+		r.LiveTraces, r.LiveSpans, r.Tombstones, r.EvictedCapacity, r.EvictedTTL, r.Lifecycles)
 	for c, n := range st.ByClass {
 		fmt.Printf("  class %-16s %d\n", c, n)
 	}

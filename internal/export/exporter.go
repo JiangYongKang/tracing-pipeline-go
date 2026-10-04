@@ -68,6 +68,11 @@ type Stats struct {
 	DeadLetterDrops int64
 	DeadLetterLen   int
 	InFlight        int
+	// Dedup bookkeeping sizes (all bounded, see Exporter docs).
+	PendingLen int
+	DeadSetLen int
+	RecentLen  int
+	RecentCap  int
 }
 
 // Exporter is a bounded, single-worker exporting stage. A single worker
@@ -168,6 +173,17 @@ func (e *Exporter) isKnownLocked(k model.SpanKey) bool {
 		}
 	}
 	return false
+}
+
+// IsProtected reports whether the span key is still inside the bounded
+// duplicate-protection window (queued, in delivery, dead-lettered or in the
+// delivered idempotency tail). Retention uses it to keep a reclaimed trace's
+// still-protected spans from being treated as resubmittable: only once this
+// returns false may a new lifecycle for that span begin.
+func (e *Exporter) IsProtected(k model.SpanKey) bool {
+	e.trackMu.Lock()
+	defer e.trackMu.Unlock()
+	return e.isKnownLocked(k)
 }
 
 // Enqueue never blocks beyond ctx/enqueueWait: a full queue is rejected
@@ -360,6 +376,9 @@ func traceHint(batch []*model.Span) string {
 func (e *Exporter) Stats() Stats {
 	e.trackMu.Lock()
 	dlLen := len(e.dl)
+	pendingLen := len(e.pending)
+	deadLen := len(e.dead)
+	recentLen := len(e.recent)
 	e.trackMu.Unlock()
 	return Stats{
 		Running:         e.running.Load(),
@@ -375,6 +394,10 @@ func (e *Exporter) Stats() Stats {
 		DeadLetterDrops: e.deadLetterDrops.Load(),
 		DeadLetterLen:   dlLen,
 		InFlight:        int(e.inFlight.Load()),
+		PendingLen:      pendingLen,
+		DeadSetLen:      deadLen,
+		RecentLen:       recentLen,
+		RecentCap:       e.recentCap,
 	}
 }
 

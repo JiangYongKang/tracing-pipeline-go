@@ -210,6 +210,12 @@ type Outcome struct {
 	Status  Class
 	Reason  string
 	Span    *Span // non-nil iff Status == ClassOK
+	// Revisit is true when the record was accepted as a new lifecycle
+	// after its previously registered identity state had been reclaimed
+	// by retention. It is purely additive: Status stays ClassOK and the
+	// span is processed normally, but the revisit is externally
+	// distinguishable instead of silently blending into first-seen data.
+	Revisit bool
 }
 
 // Decision is a per-trace sampling verdict.

@@ -11,6 +11,7 @@ import (
 	"github.com/highcumontoa/tracing-pipeline-go/internal/export"
 	"github.com/highcumontoa/tracing-pipeline-go/internal/model"
 	"github.com/highcumontoa/tracing-pipeline-go/internal/pipeline"
+	"github.com/highcumontoa/tracing-pipeline-go/internal/retention"
 )
 
 func main() {
@@ -22,7 +23,11 @@ func main() {
 		RetryBackoff:       2 * time.Millisecond,
 		DeadLetterCapacity: 32,
 	}
-	p := pipeline.New(cfg, 1.0, log.Printf)
+	// Tight retention bounds so the demo actually triggers reclamation
+	// and revisit classification; production defaults are far larger.
+	p := pipeline.NewWithRetention(cfg, 1.0,
+		retention.Config{MaxEntries: 64, TTL: time.Minute, JournalCapacity: 1024},
+		log.Printf)
 	p.Start()
 	defer func() {
 		// Bounded shutdown: backpressure policy already permits rejecting
@@ -89,6 +94,26 @@ func main() {
 		}
 	}
 	fmt.Printf("burst rejections due to bounded backpressure: %d\n", full)
+	flush(p)
+
+	fmt.Println("== phase 6: retention reclamation + revisit after eviction ==")
+	p.Reporter().SetBehavior(export.Behavior{Mode: export.ModeOK})
+	// t1 was last touched in phase 3; the burst above already flooded
+	// enough unique traces to reclaim its runtime state (cap is 64),
+	// and the flood below keeps churning.
+	for i := 0; i < 200; i++ {
+		p.Submit(model.RawRecord{
+			Source:  model.SourceInproc,
+			TraceID: fmt.Sprintf("%032x", 600000+i), SpanID: fmt.Sprintf("%016x", 600000+i),
+			Name: "churn", StartNano: 1, EndNano: 2,
+		})
+	}
+	// A brand-new span of the long-idle trace t1 reopens it: the result
+	// is flagged as a revisit (new lifecycle), never silently dropped.
+	res := p.Submit(model.RawRecord{Source: model.SourceInproc, TraceID: t1, SpanID: "abababababababab", Name: "revisited", StartNano: 5, EndNano: 6})
+	fmt.Printf("revisit of reclaimed trace t1: revisit=%v decision=%s enqueued=%v\n",
+		res.Revisit, res.Decision, res.Enqueued)
+	flush(p)
 
 	printStats(p)
 }
@@ -110,9 +135,15 @@ func printStats(p *pipeline.Pipeline) {
 		fmt.Printf("  class %-16s %d\n", c, n)
 	}
 	e := st.Export
-	fmt.Printf("export: enqueued=%d sent_spans=%d batches=%d retries=%d rejected_full=%d rejected_dup=%d deadlettered=%d dl_dropped=%d dl_held=%d\n",
+	fmt.Printf("export: enqueued=%d sent_spans=%d batches=%d retries=%d rejected_full=%d rejected_dup=%d deadlettered=%d dl_dropped=%d dl_held=%d pending=%d recent=%d/%d\n",
 		e.Enqueued, e.SentSpans, e.BatchesSent, e.Retries, e.RejectedFull, e.RejectedDup,
-		e.DeadLettered, e.DeadLetterDrops, e.DeadLetterLen)
+		e.DeadLettered, e.DeadLetterDrops, e.DeadLetterLen, e.PendingLen, e.RecentLen, e.RecentCap)
+	r := st.Retention
+	fmt.Printf("retention: revisits=%d ingest=%d/%d(evicted=%d) decisions=%d/%d(evicted=%d) verdicts=%d/%d(evicted=%d)\n",
+		r.Revisits,
+		r.IngestSpans.Retained, r.IngestSpans.Capacity, r.IngestSpans.EvictedTotal,
+		r.SamplerDecisions.Retained, r.SamplerDecisions.Capacity, r.SamplerDecisions.EvictedTotal,
+		r.SamplerSpanVerdicts.Retained, r.SamplerSpanVerdicts.Capacity, r.SamplerSpanVerdicts.EvictedTotal)
 	for i, dl := range p.Exporter().DeadLetters() {
 		if i >= 5 {
 			fmt.Printf("  ... %d more dead letters\n", e.DeadLetterLen-5)

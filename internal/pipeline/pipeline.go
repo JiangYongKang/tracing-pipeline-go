@@ -10,6 +10,7 @@ import (
 	"github.com/highcumontoa/tracing-pipeline-go/internal/export"
 	"github.com/highcumontoa/tracing-pipeline-go/internal/ingest"
 	"github.com/highcumontoa/tracing-pipeline-go/internal/model"
+	"github.com/highcumontoa/tracing-pipeline-go/internal/retention"
 	"github.com/highcumontoa/tracing-pipeline-go/internal/sampler"
 )
 
@@ -21,6 +22,22 @@ type Result struct {
 	Decision      model.Decision
 	ExportFailure model.FailureClass // FailNone when accepted/exported or not applicable
 	Enqueued      bool
+	// Revisit is true when the record reopened a trace/span identity
+	// whose runtime state had already been reclaimed by retention: it
+	// starts a new, externally distinguishable lifecycle.
+	Revisit bool
+}
+
+// RetentionStats aggregates the bounded runtime-state bookkeeping of
+// every stage, so retention, reclamation and revisit classification are
+// externally queryable through the existing Stats entry point.
+type RetentionStats struct {
+	IngestSpans         retention.Stats // normalizer span-identity registry
+	SamplerDecisions    retention.Stats // frozen per-trace verdicts
+	SamplerSpanVerdicts retention.Stats // per-span parent verdicts
+	// Revisits counts accepted records that reopened a reclaimed
+	// trace/span identity under a new lifecycle.
+	Revisits int64
 }
 
 // Stats aggregates all stage counters for external queries.
@@ -31,6 +48,7 @@ type Stats struct {
 	Dropped      int64
 	NormalizedOK int64
 	Export       export.Stats
+	Retention    RetentionStats
 }
 
 // Pipeline is safe for concurrent use.
@@ -44,21 +62,30 @@ type Pipeline struct {
 	received atomic.Int64
 	sampled  atomic.Int64
 	dropped  atomic.Int64
+	revisits atomic.Int64
 
 	closeOnce sync.Once
 }
 
-// New constructs a pipeline with a local mock reporting endpoint.
-// logf may be nil.
+// New constructs a pipeline with a local mock reporting endpoint and
+// bounded default retention for runtime trace state. logf may be nil.
 func New(cfg export.Config, ratio float64, logf func(format string, args ...any)) *Pipeline {
+	return NewWithRetention(cfg, ratio, retention.DefaultConfig(), logf)
+}
+
+// NewWithRetention constructs a pipeline with explicit retention bounds
+// for the runtime trace state (ingest identity registry and frozen
+// sampling decisions), so a long-running process keeps a hard upper
+// bound on retained state no matter how many unique traces it ingests.
+func NewWithRetention(cfg export.Config, ratio float64, rcfg retention.Config, logf func(format string, args ...any)) *Pipeline {
 	if logf == nil {
 		logf = func(string, ...any) {}
 	}
 	rep := export.NewMockReporter()
 	return &Pipeline{
 		log:      logf,
-		norm:     ingest.New(),
-		sampler:  sampler.New(ratio),
+		norm:     ingest.NewWithRetention(rcfg, logf),
+		sampler:  sampler.NewWithRetention(ratio, rcfg, logf),
 		exporter: export.New(cfg, rep, logf),
 		reporter: rep,
 	}
@@ -67,14 +94,20 @@ func New(cfg export.Config, ratio float64, logf func(format string, args ...any)
 // newWithReporter constructs a pipeline around an arbitrary reporter. It is
 // used by tests that need to observe exactly which spans were delivered.
 func newWithReporter(logf func(string, ...any), rep export.Reporter, cfg export.Config, ratio float64) *Pipeline {
+	return newWithReporterRetention(logf, rep, cfg, ratio, retention.DefaultConfig())
+}
+
+// newWithReporterRetention is newWithReporter with explicit retention
+// bounds, for tests that exercise reclamation and revisits.
+func newWithReporterRetention(logf func(string, ...any), rep export.Reporter, cfg export.Config, ratio float64, rcfg retention.Config) *Pipeline {
 	if logf == nil {
 		logf = func(string, ...any) {}
 	}
 	mock, _ := rep.(*export.MockReporter)
 	return &Pipeline{
 		log:      logf,
-		norm:     ingest.New(),
-		sampler:  sampler.New(ratio),
+		norm:     ingest.NewWithRetention(rcfg, logf),
+		sampler:  sampler.NewWithRetention(ratio, rcfg, logf),
 		exporter: export.New(cfg, rep, logf),
 		reporter: mock,
 	}
@@ -101,11 +134,19 @@ func (p *Pipeline) Submit(raw model.RawRecord) Result {
 	}
 
 	span := out.Span
-	d := p.sampler.Decide(span)
+	d, samplerRevisit := p.sampler.DecideWithLifecycle(span)
 	res.Decision = d
+	res.Revisit = out.Revisit || samplerRevisit
+	if res.Revisit {
+		p.revisits.Add(1)
+	}
+	lifecycle := ""
+	if res.Revisit {
+		lifecycle = " lifecycle=revisit"
+	}
 	if d == model.DecisionDrop {
 		p.dropped.Add(1)
-		p.log("trace=%s span=%s decision=drop class=ok", span.TraceID, span.SpanID)
+		p.log("trace=%s span=%s decision=drop class=ok%s", span.TraceID, span.SpanID, lifecycle)
 		return res
 	}
 	p.sampled.Add(1)
@@ -114,10 +155,10 @@ func (p *Pipeline) Submit(raw model.RawRecord) Result {
 	res.Enqueued = er.Accepted
 	res.ExportFailure = er.Reason
 	if er.Accepted {
-		p.log("trace=%s span=%s decision=sample export=enqueued", span.TraceID, span.SpanID)
+		p.log("trace=%s span=%s decision=sample export=enqueued%s", span.TraceID, span.SpanID, lifecycle)
 	} else {
-		p.log("trace=%s span=%s decision=sample export=rejected failure=%s",
-			span.TraceID, span.SpanID, er.Reason)
+		p.log("trace=%s span=%s decision=sample export=rejected failure=%s%s",
+			span.TraceID, span.SpanID, er.Reason, lifecycle)
 	}
 	return res
 }
@@ -144,9 +185,11 @@ func (p *Pipeline) EnqueueSpan(ctx context.Context, span *model.Span) export.Enq
 	return p.exporter.Enqueue(ctx, span)
 }
 
-// Stats returns an aggregated snapshot.
+// Stats returns an aggregated snapshot, including the bounded retention
+// bookkeeping (retained vs. capacity, reclamation counters, revisits).
 func (p *Pipeline) Stats() Stats {
 	classCounts := p.norm.ClassCounts()
+	dec, verdicts := p.sampler.RetentionStats()
 	return Stats{
 		Received:     p.received.Load(),
 		ByClass:      classCounts,
@@ -154,6 +197,12 @@ func (p *Pipeline) Stats() Stats {
 		Dropped:      p.dropped.Load(),
 		NormalizedOK: classCounts[model.ClassOK],
 		Export:       p.exporter.Stats(),
+		Retention: RetentionStats{
+			IngestSpans:         p.norm.RetentionStats(),
+			SamplerDecisions:    dec,
+			SamplerSpanVerdicts: verdicts,
+			Revisits:            p.revisits.Load(),
+		},
 	}
 }
 

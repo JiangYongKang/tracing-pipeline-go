@@ -6,8 +6,10 @@ package ingest
 import (
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"github.com/highcumontoa/tracing-pipeline-go/internal/model"
+	"github.com/highcumontoa/tracing-pipeline-go/internal/retention"
 )
 
 // knownSources is the set of ingress channels the normalizer understands.
@@ -17,22 +19,40 @@ var knownSources = map[model.Source]struct{}{
 	model.SourceInproc:      {},
 }
 
-// Normalizer is safe for concurrent use. It keeps a registry of known
-// span identities so that duplicate ids and cross-trace id conflicts can
-// never pollute previously accepted data.
+// Normalizer is safe for concurrent use. It keeps a bounded registry of
+// known span identities so that duplicate ids and cross-trace id
+// conflicts can never pollute previously accepted data, and so the
+// registry itself never grows without bound in a long-running process.
 type Normalizer struct {
 	mu sync.Mutex
-	// spanOwner maps span id -> trace id for every accepted span.
-	spanOwner map[model.SpanID]model.TraceID
+	// spanOwner maps span id -> trace id for every accepted span, bounded
+	// by a retention.Store with deterministic reclamation.
+	spanOwner *retention.Store[model.SpanID, model.TraceID]
 	// counts per normalization class, externally queryable.
 	counts map[model.Class]int64
+	// revisits counts accepted records whose previous identity state had
+	// already been reclaimed (new lifecycle, externally distinguishable).
+	revisits atomic.Int64
 }
 
-// New builds a Normalizer.
+// New builds a Normalizer with bounded default retention.
 func New() *Normalizer {
+	return NewWithRetention(retention.DefaultConfig(), nil)
+}
+
+// NewWithRetention builds a Normalizer with explicit retention bounds for
+// the span-identity registry. logf may be nil; when set, every
+// reclamation is logged with the span id, owning trace id and reason.
+func NewWithRetention(cfg retention.Config, logf func(format string, args ...any)) *Normalizer {
+	if logf == nil {
+		logf = func(string, ...any) {}
+	}
 	return &Normalizer{
-		spanOwner: make(map[model.SpanID]model.TraceID),
-		counts:    make(map[model.Class]int64),
+		spanOwner: retention.NewStore(cfg, nil,
+			func(sid model.SpanID, owner model.TraceID, r retention.Reason) {
+				logf("retention evict stage=ingest-span-owner trace=%s span=%s reason=%s", owner, sid, r)
+			}),
+		counts: make(map[model.Class]int64),
 	}
 }
 
@@ -84,7 +104,7 @@ func (n *Normalizer) Normalize(raw model.RawRecord) model.Outcome {
 
 	// Identity checks happen last and only for otherwise valid records,
 	// so a malformed duplicate is reported by its malformation first.
-	if owner, seen := n.spanOwner[sid]; seen {
+	if owner, seen := n.spanOwner.Get(sid); seen {
 		if owner == tid {
 			n.counts[model.ClassDuplicate]++
 			return model.Outcome{Source: raw.Source, RawHint: hint, Status: model.ClassDuplicate,
@@ -95,12 +115,17 @@ func (n *Normalizer) Normalize(raw model.RawRecord) model.Outcome {
 			Reason: "span id already registered under trace " + owner.String()}
 	}
 
-	n.spanOwner[sid] = tid
-	if n.counts == nil {
-		n.counts = make(map[model.Class]int64)
+	// The identity is not currently registered. If it was registered
+	// before and reclaimed by retention, this record deterministically
+	// opens a new lifecycle and is flagged as a revisit, so a late or
+	// repeated report is distinguishable instead of silently blending in.
+	revisit := n.spanOwner.WasEvicted(sid)
+	n.spanOwner.Put(sid, tid)
+	if revisit {
+		n.revisits.Add(1)
 	}
 	n.counts[model.ClassOK]++
-	return model.Outcome{Source: raw.Source, RawHint: hint, Status: model.ClassOK, Span: span}
+	return model.Outcome{Source: raw.Source, RawHint: hint, Status: model.ClassOK, Span: span, Revisit: revisit}
 }
 
 func (n *Normalizer) bump(c model.Class) {
@@ -112,12 +137,19 @@ func (n *Normalizer) bump(c model.Class) {
 	n.counts[c]++
 }
 
-// KnownSpanCount reports how many valid, distinct spans are registered.
+// KnownSpanCount reports how many valid, distinct spans are currently
+// registered (bounded by the retention cap).
 func (n *Normalizer) KnownSpanCount() int {
-	n.mu.Lock()
-	defer n.mu.Unlock()
-	return len(n.spanOwner)
+	return n.spanOwner.Len()
 }
+
+// RevisitCount reports how many accepted records reopened a reclaimed
+// identity under a new lifecycle.
+func (n *Normalizer) RevisitCount() int64 { return n.revisits.Load() }
+
+// RetentionStats exposes the reclamation bookkeeping of the bounded
+// span-identity registry for external queries.
+func (n *Normalizer) RetentionStats() retention.Stats { return n.spanOwner.Stats() }
 
 // ClassCounts returns a copy of per-class normalization counters.
 func (n *Normalizer) ClassCounts() map[model.Class]int64 {

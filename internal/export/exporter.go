@@ -68,6 +68,12 @@ type Stats struct {
 	DeadLetterDrops int64
 	DeadLetterLen   int
 	InFlight        int
+	// Duplicate-protection bookkeeping, all hard-bounded:
+	// PendingLen <= QueueCapacity+BatchMax, RecentLen <= RecentCap,
+	// DeadLetterLen <= DeadLetterCapacity.
+	PendingLen int
+	RecentLen  int
+	RecentCap  int
 }
 
 // Exporter is a bounded, single-worker exporting stage. A single worker
@@ -360,6 +366,8 @@ func traceHint(batch []*model.Span) string {
 func (e *Exporter) Stats() Stats {
 	e.trackMu.Lock()
 	dlLen := len(e.dl)
+	pendingLen := len(e.pending)
+	recentLen := len(e.recent)
 	e.trackMu.Unlock()
 	return Stats{
 		Running:         e.running.Load(),
@@ -375,6 +383,9 @@ func (e *Exporter) Stats() Stats {
 		DeadLetterDrops: e.deadLetterDrops.Load(),
 		DeadLetterLen:   dlLen,
 		InFlight:        int(e.inFlight.Load()),
+		PendingLen:      pendingLen,
+		RecentLen:       recentLen,
+		RecentCap:       e.recentCap,
 	}
 }
 

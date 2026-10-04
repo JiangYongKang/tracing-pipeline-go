@@ -13,6 +13,7 @@
 | `internal/ingest` | 多来源上下文归一化、字段校验、去重/冲突与断裂归类 |
 | `internal/sampler` | 父级一致、按 trace 冻结、对 traceID 确定性派生的采样器 |
 | `internal/export` | 本地模拟上报端 `MockReporter` + 有界导出器（背压/重试/死信/统计） |
+| `internal/retention` | 运行期状态的有界保留：容量+TTL、确定性回收、有界回收日志（重访归类） |
 | `internal/pipeline` | 串联 `归一化 → 采样 → 导出` 的并发安全入口 |
 | `cmd/demo` | 本地可运行演示 |
 
@@ -107,6 +108,76 @@ queue_full / attempts_exhausted / duplicate`，全部计数可查询
 > 复用**已归一化、已冻结决策**的跨度做有界重试（不要重发原始记录，否则会被正确
 > 判为 `duplicate`），或按业务丢弃并统计 `queue_full`。
 
+## 运行期状态保留与回收（长期驻留的硬上界）
+
+进程常驻运行、持续摄入大量唯一链路时，入口侧需要保留的状态（归一化的身份注册表、
+冻结的采样结论、父跨度结论）全部由 `internal/retention` 的有界存储承载，**默认配置
+即有硬上界**，老代码不改调用方式（`pipeline.New` / `ingest.New` / `sampler.New`）
+自动获得该上界。
+
+### 配置
+
+```go
+rcfg := retention.Config{
+    MaxEntries:      32768,          // 活条目硬上限（容量维度）
+    TTL:             10 * time.Minute, // 触达后最长保留窗口（时间维度，<=0 关闭）
+    JournalCapacity: 32768,          // 回收日志（tombstone）上限，用于重访归类
+}
+p := pipeline.NewWithRetention(exportCfg, 0.5, rcfg, logf) // pipeline.New 等价于用 DefaultConfig()
+```
+
+`MaxEntries` 与 `TTL` 是**组合**生效的：活条目数永远 `<= MaxEntries`；条目在最后一次
+触达后超过 `TTL` 即被回收。每次读写都会刷新该条目的触达时间（LRU 语义），因此持续
+有跨度到达的链路不会被回收，只有"不再回来"的老链路会被确定性回收。
+
+### 状态上界怎么算
+
+| 状态 | 持有者 | 上界 |
+| --- | --- | --- |
+| 跨度身份注册表 `spanOwner` | `ingest.Normalizer` | `MaxEntries` |
+| 冻结采样结论 `decisions` | `sampler.Sampler` | `MaxEntries` |
+| 父跨度结论 `spanVerdict` | `sampler.Sampler` | `MaxEntries` |
+| 回收日志（每 store 一份） | 上述三处 | 各 `JournalCapacity` |
+| 导出防重复簿记 `pending/dead/recent` | `export.Exporter` | `QueueCapacity+BatchMax`、`DeadLetterCapacity`、`4*QueueCapacity`（原有，不变） |
+
+进程保留的链路状态总量因此是配置常数的函数，与"见过的唯一链路数"无关。
+
+### 回收规则（确定、可复现、不卡住入口）
+
+- 回收顺序确定：永远先回收**最久未触达**的条目；同一事件序列必然得到同一保留集合。
+- 写路径每次回收的工作量有界（过期扫描分批 `sweepBatch=256`，容量回收按新条目数
+  逐个进行，均为摊还 O(1)），入口不会被长时间卡住；完整扫描只发生在查询路径上。
+- 每次回收都计入 `EvictedTotal`（含 `ExpiredTotal` 细分）并可经日志钩子输出
+  （`retention evict stage=... trace=... reason=capacity|expired`）；当前实际保留量
+  `Retained`、容量 `Capacity`、回收次数均可通过 `Pipeline.Stats().Retention`、
+  `Sampler.Snapshot()`、`Normalizer.RetentionStats()` 查询。
+
+### 回收后重访的语义
+
+- **保留期内**：一切既有语义不变——父子采样结论一致、运行中改比例不翻转已开始
+  链路、未采样链路不会只导出部分跨度、重复/冲突归类不变。
+- **保留期结束后同一条链路再次出现**（迟到的子跨度、重复上报）：确定性地进入一个
+  **新生命周期**，并给出外部可识别的归类——`model.Outcome.Revisit` /
+  `pipeline.Result.Revisit` 为 `true`，日志带 `lifecycle=revisit`，计数经
+  `Stats().Retention.Revisits` 查询。绝不静默丢弃，也绝不并入其他链路的结论。
+- 若该链路仍**有父跨度结论在保留期内**，新到达的跨度沿用这条仍受保护的原有结论
+  （与既有"父级一致"规则同源）；否则按 trace id 与**当前**比例重新派生——这与
+  "改比例不翻转已开始链路"不矛盾：被回收的链路已结束其生命周期。
+- 重访识别依赖有界回收日志：被回收的标识在 `JournalCapacity` 窗口内再次出现时
+  归类为 `revisit`；窗口之外则在信息论上无法与"全新链路"区分，按全新链路处理——
+  行为仍然确定，只是归类不同。journal 本身也是有界的，不会成为新的增长点。
+
+### 与采样 / 背压 / 死信的关系
+
+- 回收只作用于**入口侧**状态；导出侧的防重复簿记（`pending/dead/recent`）独立保持
+  有界，其当前量与上界经 `Exporter.Stats()`（`PendingLen/RecentLen/RecentCap/
+  DeadLetterLen`）查询。
+- 一个跨度**已受理未上报完、在死信环中、或仍在 `recent` 幂等尾内**时，即使入口侧
+  状态已被回收并以 `revisit` 重新进入，导出器仍返回 `FailDuplicate` 拒绝重复入队——
+  保护范围内不允许重新开始生命周期。
+- 只有当该跨度滚出 `recent` 保护范围后，同一 `(TraceID,SpanID)` 才允许以新生命周期
+  被再次受理、再次上报；这次重报同样带 `revisit` 归类，可外部区分。
+
 ## 本地验证
 
 ```bash
@@ -120,7 +191,12 @@ go test -race ./...
 # 仅看关键集成用例（-v 会打印链路标识、采样结论、失败归类日志）
 go test -race -v ./internal/pipeline
 
-# 本地端到端演示：三来源归一化、拒绝归类、运行中改比例、端点故障、慢端点背压
+# 回收与重访相关用例
+go test -race -v ./internal/retention/ -run .
+go test -race -v ./internal/pipeline/ -run 'Eviction|Revisit|Retention'
+
+# 本地端到端演示：三来源归一化、拒绝归类、运行中改比例、端点故障、慢端点背压、
+# 保留回收与回收后重访
 go run ./cmd/demo
 ```
 
@@ -133,13 +209,21 @@ go run ./cmd/demo
   0/1 边界全有或全无；同一 trace 并发决策一致。
 - `internal/export`：精确一次送达与重复拒绝；卡死端点下有界 `queue_full`；
   重试耗尽入死信恰好一次；死信环有界丢最旧；死信幂等；`MockReporter` 各模式。
+- `internal/retention`：容量回收最冷优先、TTL 过期（注入假时钟）、回收日志有界、
+  并发写下持续回收时硬上界恒成立、默认配置即有界。
 - `internal/pipeline`：
   - `TestConcurrentNoDuplicateNoLoss`：1000 个并发跨度，送达集合不重不漏；
   - `TestConcurrentSamplingAllOrNothing`：每条 trace 导出跨度为 0 或完整集合，
     且与采样器冻结结论、采样/丢弃计数完全吻合；
   - `TestEndpointFailureDeadLettersAndCounters`：故障期跨度恰好一次进死信、计数可查；
   - `TestBackpressureUnderStuckEndpoint`：慢端点下生产者快速得到 `queue_full`、
-    不被无限阻塞，已受理跨度最终不丢不重。
+    不被无限阻塞，已受理跨度最终不丢不重；
+  - `TestConcurrentWritesWithContinuousEviction`：3000 条唯一链路并发写入、回收
+    持续进行，保留量始终不超容量、回收次数可查，已受理跨度仍不重不漏；
+  - `TestRevisitAfterEviction`：链路状态被回收后重访——导出保护期内重提交被判
+    `duplicate` 不重复报送，迟到子跨度以 `revisit` 新生命周期采样导出，滚出防
+    重复保护范围后同一跨度才允许再次受理；
+  - `TestDefaultRetentionIsBounded`：默认配置下各状态上界存在且可查询。
 
 单测日志由 `testing.T.Log` 输出，关键行包含链路标识与结论，例如：
 
@@ -147,6 +231,9 @@ go run ./cmd/demo
 trace=... span=... decision=sample export=enqueued
 trace=... span=... decision=drop class=ok
 trace=... span=... decision=sample export=rejected failure=queue_full
+trace=... span=... decision=sample export=enqueued lifecycle=revisit
 ingest reject source=inproc hint=inproc:<trace>/<span> class=broken_parent reason="..."
 export attempt=2/3 failed class=endpoint_error spans=8 trace=...
+retention evict stage=sampler-decisions trace=... decision=sample reason=capacity
+retention evict stage=ingest-span-owner trace=... span=... reason=expired
 ```
